@@ -6,15 +6,12 @@ from io import BufferedIOBase
 from typing import IO, Iterable, Iterator, Optional, Tuple, cast
 
 from torchdata.datapipes.utils.common import validate_pathname_binary_tuple
-from torchdata.datapipes import functional_datapipe
-from torchdata.datapipes.iter import IterDataPipe
-
-# TODO(VitalyFedyunin): This file copy-pasted from the pytorch repo
-# nuke source class when repo is open-sourced
+from torchdata.datapipes.iter.util._archivereader import _ArchiveReaderIterDataPipe
+from torch.utils.data import functional_datapipe
 
 
 @functional_datapipe("read_from_tar")
-class TarArchiveReaderIterDataPipe(IterDataPipe[Tuple[str, BufferedIOBase]]):
+class TarArchiveReaderIterDataPipe(_ArchiveReaderIterDataPipe):
     r""":class:`TarArchiveReaderIterDataPipe`.
 
     Iterable DataPipe to extract tar binary streams from input iterable which contains tuples of path name and
@@ -42,6 +39,7 @@ class TarArchiveReaderIterDataPipe(IterDataPipe[Tuple[str, BufferedIOBase]]):
         for data in self.datapipe:
             validate_pathname_binary_tuple(data)
             pathname, data_stream = data
+            self._open_source_streams[pathname].append(data_stream)
             folder_name = os.path.dirname(pathname)
             try:
                 # typing.cast is used here to silence mypy's type checker

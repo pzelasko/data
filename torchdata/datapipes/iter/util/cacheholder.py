@@ -1,13 +1,13 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+import os.path
 import sys
 
 from collections import deque
-from io import IOBase
-from os import path
-from typing import Callable, Deque, Iterator, Optional, Tuple, TypeVar
+from typing import Deque, Iterator, Optional, TypeVar
 
+from torch.utils.data.graph import traverse
 from torchdata.datapipes import functional_datapipe
-from torchdata.datapipes.iter import IterDataPipe, FileLoader
+from torchdata.datapipes.iter import IterDataPipe
 from torchdata.datapipes.utils.common import _default_filepath_fn
 
 T_co = TypeVar("T_co", covariant=True)
@@ -68,70 +68,106 @@ class InMemoryCacheHolderIterDataPipe(IterDataPipe[T_co]):
 
 
 @functional_datapipe("on_disk_cache")
-class OnDiskCacheHolderIterDataPipe(IterDataPipe[Tuple[str, IOBase]]):
+class OnDiskCacheHolderIterDataPipe(IterDataPipe):
     """
-    `OnDiskCacheHolder` is a factory DataPipe to create cached local file
-    for the output of opDataPipe, which is normally performance
-    bottleneck like Download, Decompress.
-    Default `filepath_fn` return a path in temporary directory based
-    on the basename of data yielded from `source_datapipe`.
+    `OnDiskCacheHolder` is a IterDataPipe that caches output of multiple DataPipe operations
+    to local files, which are normally performance bottleneck like download, decompress,
+    and etc.
+
+    Use `end_caching()` to stop tracing the sequence of DataPipe operations and save result to local files.
 
     Args:
-        source_datapipe: source DataPipe with URLs or file strings
-        opDataPipe: DataPipe to perform the desired operation on the source (e.g. download, decompress)
-        op_args: arguments for opDataPipe
-        op_kwargs: keyword arguments for opDataPipe
-        op_map: function that will be applied via .map to opDataPipe
-        mode: mode in which the file will be opened for write the data
-        filepath_fn: Given URL or file path string, returns a path to the target directory
+        source_datapipe: DataPipe with URLs or file strings
+        filepath_fn: Given URL or file path string, returns a file path to local file system. As default,
+            a file path in a temporary directory with basename of the given URL or file path is returned
+        extra_check_fn: Given the file path returned by `filepath_fn`, returns if the traced DataPipe
+            operation can be skipped as the result has been correctly cached. By default, it will check if
+            the cached file exists in local file system. Hash check can be specified by this function.
 
     Example:
-        from urllib.parse import urlparse
+        url = IterableWrapper(["https://path/to/filename", ])
+        cache_dp = url.on_disk_cache().open_url().map(fn=lambda x: b''.join(x), input_col=1).end_caching()
 
-        def url_path_fn(url):
-            return "~/.data/" + url.stripe().split('/')[-1]
+        # Cache with Hash check
+        def hash_fn(filepath):
+            hash_fn = hashlib.md5()
+            with open(filepath, "rb") as f:
+                chunk = f.read(1024 ** 2)
+                while chunk:
+                    hash_fn.update(chunk)
+                    chunk = f.read(1024 ** 2)
+            return hash_fn.hexdigest() == expected_MD5_hash
 
-        dp = ListofUrl(urls).on_disk_cache(HTTPReader, filepath_fn=url_path_fn)
-        # Existing file will be skipped for downloading and directly loaded from disk
-        # Non-existing file will be downloaded by HTTP request and saved to disk, then loaded from disk
+        cache_dp = url.on_disk_cache(extra_check_fn=hash_fn).open_url().map(fn=lambda x: b''.join(x), input_col=1).end_caching()
     """
-
-    def __new__(
-        cls,
-        source_datapipe: IterDataPipe,
-        opDataPipe,
-        op_args=None,
-        op_kwargs=None,
-        op_map: Optional[Callable] = None,
-        mode: str = "wb",
-        filepath_fn: Callable = _default_filepath_fn,
+    def __init__(
+        self,
+        source_datapipe,
+        filepath_fn=_default_filepath_fn,
+        extra_check_fn=None,
     ):
+        self.source_datapipe = source_datapipe
+        self.filepath_fn = filepath_fn
+        self.extra_check_fn = extra_check_fn
+        self._end_caching_flag: bool = False
 
-        assert isinstance(source_datapipe, IterDataPipe), "'source_datapipe' needs to be an IterDataPipe"
-        if op_args is None:
-            op_args = ()
-        if op_kwargs is None:
-            op_kwargs = {}
-        # source_datapipe should either yield url or file string
-        dp = source_datapipe.map(fn=lambda data: (filepath_fn(data), data))
-        # Out of order
-        cached_dp, todo_dp = dp.demux(2, lambda d: 0 if path.exists(d[0]) else 1)
+    def __iter__(self):
+        if self._end_caching_flag:
+            for d in self.source_datapipe:
+                yield d
+        else:
+            # In case of BC breaking, use RuntimeError for now. Warning is another option
+            raise RuntimeError("Please call `end_caching()` before iteration.")
+
+    def __add__(self, other_datapipe):
+        raise RuntimeError("`OnDiskCacheHolder` doesn't support add operation")
+
+    def _cache_check_fn(self, data):
+        filepath = self.filepath_fn(data)
+        if not os.path.exists(filepath):
+            return False
+        if self.extra_check_fn:
+            return self.extra_check_fn(filepath)
+        return True
+
+    def _end_caching(self):
+        todo_dp, cached_dp = self.source_datapipe.demux(2, self._cache_check_fn)
+        self._end_caching_flag = True
+        # Re-assign source_datapipe
+        self.source_datapipe = todo_dp
 
         # Cached: keeps filepath
-        cached_dp = cached_dp.map(fn=lambda data: data[0])
+        return cached_dp.map(fn=self.filepath_fn)
 
-        # Non-cached
-        # opDataPipe yield bytes
-        if not op_map:
-            todo_dp = opDataPipe(todo_dp.map(fn=lambda data: data[1]), *op_args, **op_kwargs).save_to_disk(
-                mode=mode, filepath_fn=filepath_fn
-            )
-        else:
-            todo_dp = (
-                opDataPipe(todo_dp.map(fn=lambda data: data[1]), *op_args, **op_kwargs)
-                .map(op_map)
-                .save_to_disk(mode=mode, filepath_fn=filepath_fn)
-            )
 
-        # Load files from local disk
-        return FileLoader(cached_dp.concat(todo_dp))
+@functional_datapipe("end_caching")
+class EndOnDiskCacheHolderIterDataPipe(IterDataPipe):
+    """
+    `EndOnDiskCacheHolder` is a IterDataPipe that indicates when theresult of
+    prior DataPipe will be saved local files specified by `filepath_fn` of
+    the corresponding `OnDiskCacheHolder`. And, the result is required to be
+    a tuple of file path and data.
+
+    Args:
+        mode: Mode in which cached files are opened for write the data. Binary mode by default.
+    """
+    def __new__(cls, datapipe, mode="wb"):
+        graph = traverse(datapipe, exclude_primitive=True)
+        cache_holder = EndOnDiskCacheHolderIterDataPipe._recursive_search(graph)
+        if cache_holder is None:
+            raise RuntimeError("Incomplete `OnDiskCacheHolder` is required in the pipeline before calling `end_caching` or `EndOnDiskCacheHolder`")
+        cached_dp = cache_holder._end_caching()
+        todo_dp = datapipe.save_to_disk(mode=mode, filepath_fn=cache_holder.filepath_fn)
+        return cached_dp.concat(todo_dp)
+
+    @staticmethod
+    def _recursive_search(graph):
+        for dp in graph.keys():
+            # Find the last CacheHolder not ended
+            if isinstance(dp, OnDiskCacheHolderIterDataPipe) and not dp._end_caching_flag:
+                return dp
+        for dp in graph.values():
+            res = EndOnDiskCacheHolderIterDataPipe._recursive_search(dp)
+            if res is not None:
+                return res
+        return None

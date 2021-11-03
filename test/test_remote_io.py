@@ -5,12 +5,15 @@ import os
 import unittest
 import warnings
 
+from functools import partial
+
 from torchdata.datapipes.iter import (
     HttpReader,
     IterableWrapper,
 )
 
 from _utils._common_utils_for_test import (
+    check_hash_fn,
     create_temp_dir,
 )
 
@@ -50,6 +53,46 @@ class TestDataPipeRemoteIO(expecttest.TestCase):
         source_dp = IterableWrapper([file_url])
         http_dp = HttpReader(source_dp)
         self.assertEqual(1, len(http_dp))
+
+    def test_on_disk_cache_holder_iterdatapipe(self):
+        file_url = "https://raw.githubusercontent.com/pytorch/data/main/LICENSE"
+        prefix = "OnDisk_"
+        expected_file_name = os.path.join(self.temp_dir.name, prefix + "LICENSE")
+        expected_MD5_hash = "4aabe940637d4389eca42ac1a0e874ec"
+
+        file_dp = IterableWrapper([file_url])
+
+        def _filepath_fn(url):
+            filename = prefix + os.path.basename(url)
+            return os.path.join(self.temp_dir.name, filename)
+
+        cache_dp = file_dp.on_disk_cache(filepath_fn=_filepath_fn, extra_check_fn=partial(check_hash_fn, expected_hash=expected_MD5_hash, hash_type="md5"))
+
+        # DataPipe Constructor
+        cache_dp = HttpReader(cache_dp)
+        # Functional API
+        cache_dp = cache_dp.map(fn=lambda x: b''.join(x), input_col=1)
+
+        # Start iteration without `end_caching`
+        with self.assertRaisesRegex(RuntimeError, "Please call"):
+            _ = list(cache_dp)
+
+        cache_dp = cache_dp.end_caching(mode="wb")
+
+        # File doesn't exist on disk
+        self.assertFalse(os.path.exists(expected_file_name))
+        path = list(cache_dp)[0]
+        self.assertTrue(os.path.exists(expected_file_name))
+
+        # File is cached to disk
+        self.assertEqual(expected_file_name, path)
+        self.assertTrue(check_hash_fn(path, expected_MD5_hash, hash_type="md5"))
+
+        # Call `end_caching` again
+        with self.assertRaisesRegex(RuntimeError, "Incomplete `OnDiskCacheHolder` is required in the pipeline"):
+            cache_dp = cache_dp.end_caching()
+
+        # TODO(ejguan): Multiple CacheHolders or nested CacheHolders
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-import os
+import os.path
 import tempfile
 
 from io import IOBase
@@ -11,7 +11,6 @@ def _default_filepath_fn(data):
     # Cross-platform Temporary Directory
     temp_dir = tempfile.gettempdir()
     return os.path.join(temp_dir, os.path.basename(data))
-    return os.path.normpath(data)
 
 
 def validate_pathname_binary_tuple(data: Tuple[str, IOBase]):
